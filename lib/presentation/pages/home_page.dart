@@ -11,12 +11,14 @@ import 'package:emi_manager/logic/currency_provider.dart';
 import 'package:emi_manager/logic/emis_provider.dart';
 import 'package:emi_manager/logic/tags_provider.dart';
 import 'package:emi_manager/presentation/constants.dart';
+import 'package:emi_manager/presentation/pages/csv_mapping_screen.dart';
 import 'package:emi_manager/presentation/pages/home/logic/home_state_provider.dart';
 import 'package:emi_manager/presentation/pages/home/widgets/tags_strip.dart';
 import 'package:emi_manager/presentation/pages/new_emi_page.dart';
 import 'package:emi_manager/presentation/router/routes.dart';
 import 'package:emi_manager/presentation/widgets/home_bar_graph.dart';
 import 'package:emi_manager/presentation/widgets/formatted_amount.dart';
+import 'package:emi_manager/services/transaction_csv_service.dart';
 import 'package:emi_manager/utils/global_formatter.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:emi_manager/presentation/l10n/app_localizations.dart';
@@ -32,6 +34,11 @@ import 'package:showcaseview/showcaseview.dart';
 import 'package:lottie/lottie.dart'; // Import Lottie package
 import '../widgets/amorzation_table.dart';
 import '../widgets/locale_selector_popup_menu.dart';
+import 'package:intl/intl.dart';
+import 'package:uuid/uuid.dart';
+import 'package:hive/hive.dart';
+import '../../data/models/transaction_model.dart';
+import 'package:emi_manager/logic/transaction_provider.dart';
 
 class HomePage extends ConsumerStatefulWidget {
   // GlobalKey loanHelpKey, GlobalKey lendHelpKey, GlobalKey langHelpKey, GlobalKey helpHelpKey
@@ -65,6 +72,9 @@ class HomePageState extends ConsumerState<HomePage> {
 
   // State variable to control Lottie animation visibility for errors
   bool _showErrorLottie = false;
+
+  bool _tourInProgress = false;
+  bool _newEmiTourInProgress = false;
 
   @override
   void didChangeDependencies() {
@@ -658,6 +668,173 @@ class HomePageState extends ConsumerState<HomePage> {
     }
   }
 
+  Future<void> _importTransactionsCSV() async {
+    try {
+      final csvService = TransactionCsvService();
+
+      // Step 1: Pick CSV file
+      final platformFile = await csvService.pickCsvFile();
+      if (platformFile == null) return;
+
+      // Show loading
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => const AlertDialog(
+          content: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 20),
+              Text('Reading CSV file...'),
+            ],
+          ),
+        ),
+      );
+
+      // Step 2: Extract headers
+      final headers = await csvService.extractCsvHeaders(platformFile);
+
+      if (context.mounted) Navigator.pop(context); // Close loading
+
+      if (headers.isEmpty) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not read CSV headers')),
+          );
+        }
+        return;
+      }
+
+      // Step 3: Show mapping screen
+      final fieldMapping = await Navigator.push<Map<String, String>>(
+        context,
+        MaterialPageRoute(
+          builder: (context) => CsvMappingScreen(
+            csvHeaders: headers,
+            onMappingComplete: (mapping) {
+              Navigator.pop(context, mapping);
+            },
+          ),
+        ),
+      );
+
+      if (fieldMapping == null) return;
+
+      // Step 4: Select which loan/lend to import to
+      final loanLendBox = Hive.box<Emi>('emis');
+      final allEmis = loanLendBox.values.toList();
+
+      if (allEmis.isEmpty) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Please create a Loan or Lend first')),
+          );
+        }
+        return;
+      }
+
+      // Show dialog to select loan/lend
+      final selectedEmi = await showDialog<Emi>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Select Loan/Lend'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: allEmis.length,
+              itemBuilder: (context, index) {
+                final emi = allEmis[index];
+                return ListTile(
+                  title: Text(emi.title),
+                  subtitle: Text(emi.emiType == 'loan' ? 'Loan' : 'Lend'),
+                  onTap: () => Navigator.pop(context, emi),
+                );
+              },
+            ),
+          ),
+        ),
+      );
+
+      if (selectedEmi == null) return;
+
+      // Show loading for parsing
+      if (context.mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => const AlertDialog(
+            content: Row(
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(width: 20),
+                Text('Importing transactions...'),
+              ],
+            ),
+          ),
+        );
+      }
+
+      // Step 5: Parse CSV with mapping
+      final transactions = await csvService.parseTransactionsCsv(
+        platformFile,
+        fieldMapping,
+        selectedEmi.id,
+      );
+
+      if (context.mounted) Navigator.pop(context); // Close loading
+
+      if (transactions.isEmpty) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No valid transactions found in CSV')),
+          );
+        }
+        return;
+      }
+
+      // Step 6: Add transactions to database
+      for (final transaction in transactions) {
+        await ref.read(transactionsNotifierProvider.notifier).add(transaction);
+      }
+
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(
+                  'Imported ${transactions.length} transactions successfully!')),
+        );
+      }
+    } catch (e) {
+      print("Error importing transactions: $e");
+      if (context.mounted) {
+        Navigator.pop(context); // Close any open dialogs
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error importing CSV: $e')),
+        );
+      }
+    }
+  }
+
+  Future<Map<String, String?>> _promptUserForMappings(
+      List<Map<String, dynamic>> transactions, List<String> tags) async {
+    if (tags.isEmpty) {
+      return {};
+    }
+
+    final result = await Navigator.push<Map<String, String?>>(
+      context,
+      MaterialPageRoute(
+        builder: (context) => MappingScreen(
+          transactions: transactions,
+          tags: tags,
+        ),
+      ),
+    );
+
+    return result ?? {};
+  }
+
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
@@ -666,6 +843,28 @@ class HomePageState extends ConsumerState<HomePage> {
     // Check if there are any EMIs in the database
     if (allEmis.isEmpty) {
       return ShowCaseWidget(
+        onFinish: () async {
+          if (_tourInProgress) {
+            setState(() {
+              _tourInProgress = false;
+              _newEmiTourInProgress = true;
+            });
+            // Navigate to NewEmiPage and start its tour
+            await Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (context) => NewEmiPage(
+                  emiType: 'loan',
+                  startTour: true,
+                  // Optionally pass a callback or use a global state to return
+                ),
+              ),
+            );
+            setState(() {
+              _newEmiTourInProgress = false;
+            });
+            // After returning from NewEmiPage, you are back on HomePage
+          }
+        },
         builder: (context) => Scaffold(
           appBar: AppBar(
             title: Text(l10n.appTitle),
@@ -679,13 +878,152 @@ class HomePageState extends ConsumerState<HomePage> {
               ),
             ],
           ),
+          key: _scaffoldKey,
+          drawer: Drawer(
+            child: ListView(
+              padding: EdgeInsets.zero,
+              children: <Widget>[
+                const DrawerHeader(
+                  decoration: BoxDecoration(color: Colors.blue),
+                  child: Text('Menu',
+                      style: TextStyle(color: Colors.white, fontSize: 24)),
+                ),
+                Showcase(
+                  key: langHelpKey,
+                  description: "You Can Choose Your Regional Language",
+                  child: const ListTile(
+                    title: Text('Select Language'),
+                    trailing: LocaleSelectorPopupMenu(),
+                  ),
+                ),
+                Showcase(
+                  key: helpHelpKey,
+                  description: "Help Button",
+                  child: ListTile(
+                    title: const Text('Help'),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.help_outline),
+                      onPressed: () {
+                        _showHelpOptions(context);
+                      },
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 13),
+                  child: ListTile(
+                    trailing: const Icon(Icons.settings),
+                    title: const Text(
+                      'Settings',
+                      style: TextStyle(fontStyle: FontStyle.normal),
+                    ),
+                    onTap: () {
+                      Navigator.pop(context); // Close the drawer
+                      context.push('/settings'); // Navigate to settings
+                    },
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: FloatingActionButton.extended(
+                    onPressed: () {
+                      showCurrencyPicker(
+                        context: context,
+                        showFlag: true,
+                        showCurrencyName: true,
+                        showCurrencyCode: true,
+                        onSelect: (Currency currency) {
+                          ref
+                              .read(currencyProvider.notifier)
+                              .setCurrencySymbol(currency.symbol);
+                        },
+                      );
+                    },
+                    backgroundColor: loanColor(context, false),
+                    label: const Text("Change Currency"),
+                    icon: const Icon(Icons.currency_exchange),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 0, left: 10, right: 10),
+                  child: FloatingActionButton.extended(
+                    onPressed: () {
+                      importPaymentsFromCSV(context);
+                    },
+                    backgroundColor: loanColor(context, false),
+                    label: const Text("Import CSV"),
+                    icon: const Icon(Icons.arrow_downward),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 10, left: 10, right: 10),
+                  child: FloatingActionButton.extended(
+                    onPressed: _importTransactionsCSV,
+                    backgroundColor:
+                        loanColor(context, false), // same color as Import CSV
+                    label: const Text("Import Transactions CSV"),
+                    icon: const Icon(
+                        Icons.arrow_downward), // same icon as Import CSV
+                  ),
+                ),
+              ],
+            ),
+          ),
           body: Center(
-            child: Lottie.asset(
-              'assets/animations/nodata_search.json',
-              width: 300,
-              height: 300,
-              fit: BoxFit.contain,
-              repeat: true,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Lottie.asset(
+                  'assets/animations/nodata_search.json',
+                  width: 200,
+                  height: 200,
+                  fit: BoxFit.contain,
+                  repeat: true,
+                ),
+                const SizedBox(height: 24),
+                AnimatedOpacity(
+                  opacity: 1.0,
+                  duration: Duration(milliseconds: 800),
+                  child: Card(
+                    elevation: 4,
+                    margin: const EdgeInsets.symmetric(horizontal: 24),
+                    child: Padding(
+                      padding: const EdgeInsets.all(24.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            AppLocalizations.of(context)!.noDataTitle,
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold, fontSize: 20),
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            AppLocalizations.of(context)!.noDataDescription,
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton.icon(
+                            icon: Icon(Icons.tour),
+                            label: Text(
+                                AppLocalizations.of(context)!.tourButtonLabel),
+                            onPressed: () {
+                              setState(() {
+                                _tourInProgress = true;
+                              });
+                              ShowCaseWidget.of(context).startShowCase([
+                                lendHelpKey,
+                                loanHelpKey,
+                              ]);
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           floatingActionButton: Row(
@@ -702,7 +1040,7 @@ class HomePageState extends ConsumerState<HomePage> {
                       MaterialPageRoute(
                         builder: (context) => const NewEmiPage(emiType: 'lend'),
                       ),
-                    ); // Use Navigator instead of GoRouter
+                    );
                   },
                   heroTag: 'newLendBtn',
                   backgroundColor: lendColor(context, false),
@@ -719,7 +1057,7 @@ class HomePageState extends ConsumerState<HomePage> {
                       MaterialPageRoute(
                         builder: (context) => const NewEmiPage(emiType: 'loan'),
                       ),
-                    ); // Use Navigator instead of GoRouter
+                    );
                   },
                   heroTag: 'newLoanBtn',
                   backgroundColor: loanColor(context, false),
@@ -750,6 +1088,27 @@ class HomePageState extends ConsumerState<HomePage> {
     });
 
     return ShowCaseWidget(
+      onFinish: () async {
+        if (_tourInProgress) {
+          setState(() {
+            _tourInProgress = false;
+            _newEmiTourInProgress = true;
+          });
+          // Navigate to NewEmiPage and start its tour
+          await Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (context) => NewEmiPage(
+                emiType: 'loan',
+                startTour: true,
+              ),
+            ),
+          );
+          setState(() {
+            _newEmiTourInProgress = false;
+          });
+          // After returning from NewEmiPage, you are back on HomePage
+        }
+      },
       builder: (context) => Scaffold(
         appBar: AppBar(
           title: Text(l10n.appTitle),
@@ -840,6 +1199,17 @@ class HomePageState extends ConsumerState<HomePage> {
                   icon: const Icon(Icons.arrow_downward),
                 ),
               ),
+              Padding(
+                padding: const EdgeInsets.only(top: 10, left: 10, right: 10),
+                child: FloatingActionButton.extended(
+                  onPressed: _importTransactionsCSV,
+                  backgroundColor:
+                      loanColor(context, false), // same color as Import CSV
+                  label: const Text("Import Transactions CSV"),
+                  icon: const Icon(
+                      Icons.arrow_downward), // same icon as Import CSV
+                ),
+              ),
             ],
           ),
         ),
@@ -872,6 +1242,8 @@ class HomePageState extends ConsumerState<HomePage> {
                         entries: _groupAmortizationEntries(allEmis),
                         startDate: DateTime.now(),
                         tenureInYears: _calculateTenure(allEmis),
+                        onDeleteEntry: (entry) =>
+                            _showDeleteConfirmation(context, entry),
                       ),
                     ),
                   ),
@@ -1086,7 +1458,9 @@ class HomePageState extends ConsumerState<HomePage> {
       double remainingPrincipal = emi.principalAmount;
       for (int month = 0; month < tenureInYears * 12; month++) {
         double monthlyInterestRate = emi.interestRate / (12 * 100);
-        double monthlyInterest = remainingPrincipal * monthlyInterestRate;
+        double monthlyInterest = monthlyInterestRate == 0
+            ? 0
+            : remainingPrincipal * monthlyInterestRate;
         double monthlyPrincipal = monthlyEmi - monthlyInterest;
         remainingPrincipal -= monthlyPrincipal;
 
@@ -1100,7 +1474,8 @@ class HomePageState extends ConsumerState<HomePage> {
             totalPayment: sign * monthlyEmi,
             year: adjustedYear,
             month: adjustedMonth,
-            type: emi.emiType == 'loan' ? 0 : 1));
+            type: emi.emiType == 'loan' ? 0 : 1,
+            emiId: emi.id)); // Add the missing emiId parameter
       }
     }
 
@@ -1113,11 +1488,16 @@ class HomePageState extends ConsumerState<HomePage> {
     double monthlyInterestRate = interestRate / (12 * 100);
     int totalMonths = tenureYears * 12;
 
-    // Calculate and return the EMI amount
-    double emiAmount = (principalAmount *
-            monthlyInterestRate *
-            pow(1 + monthlyInterestRate, totalMonths)) /
-        (pow(1 + monthlyInterestRate, totalMonths) - 1);
+    double emiAmount;
+    if (monthlyInterestRate == 0 || totalMonths == 0) {
+      emiAmount =
+          totalMonths > 0 ? principalAmount / totalMonths : principalAmount;
+    } else {
+      emiAmount = (principalAmount *
+              monthlyInterestRate *
+              pow(1 + monthlyInterestRate, totalMonths)) /
+          (pow(1 + monthlyInterestRate, totalMonths) - 1);
+    }
 
     // Apply rounding from our GlobalFormatter
     return GlobalFormatter.roundNumber(ref, emiAmount);
@@ -1146,6 +1526,38 @@ class HomePageState extends ConsumerState<HomePage> {
         ],
       ),
     );
+  }
+
+  void _showDeleteConfirmation(
+      BuildContext context, AmortizationEntry entry) async {
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(AppLocalizations.of(context)!.confirmDelete),
+        content: Text(AppLocalizations.of(context)!.areYouSure),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(AppLocalizations.of(context)!.cancel),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(AppLocalizations.of(context)!.delete),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldDelete == true) {
+      final loanLendBox = Hive.box<Emi>('emis');
+      final emiToDelete = loanLendBox.values.firstWhere(
+          (emi) => emi.id == entry.emiId,
+          orElse: () =>
+              throw Exception('Emi with ID ${entry.emiId} not found'));
+
+      ref.read(emisNotifierProvider.notifier).remove(emiToDelete);
+      _triggerComparisonLottie(); // Trigger scales balancing animation
+    }
   }
 }
 
@@ -1203,7 +1615,7 @@ class EmiCard extends ConsumerWidget {
                     ),
                   ),
                   PopupMenuButton<String>(
-                    onSelected: (value) {
+                    onSelected: (value) async {
                       if (value == 'edit') {
                         final emiId = emi.id;
                         final emiType = emi.emiType;
@@ -1212,6 +1624,18 @@ class EmiCard extends ConsumerWidget {
                                 .location);
                       } else if (value == 'delete') {
                         _deleteEmi(context, ref, emi);
+                      } else if (value == 'duplicate') {
+                        // Create a copy of the EMI item
+                        final duplicatedEmi = emi.duplicate();
+
+                        // Add to your main EMI list (using emiType if needed)
+                        await ref
+                            .read(emisNotifierProvider.notifier)
+                            .add(duplicatedEmi);
+
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Item duplicated!')),
+                        );
                       }
                     },
                     itemBuilder: (context) => [
@@ -1222,6 +1646,10 @@ class EmiCard extends ConsumerWidget {
                       PopupMenuItem<String>(
                         value: 'delete',
                         child: Text(l10n.delete),
+                      ),
+                      PopupMenuItem<String>(
+                        value: 'duplicate',
+                        child: Text('Duplicate'), // <-- Add Duplicate option
                       ),
                     ],
                     icon: const Icon(Icons.more_vert),
@@ -1458,4 +1886,110 @@ class _HomePageNavigatorObserver extends NavigatorObserver {
   void didPopNext() {
     homePageState._triggerComparisonLottie();
   }
+}
+
+class MappingScreen extends StatefulWidget {
+  final List<Map<String, dynamic>> transactions;
+  final List<String> tags;
+
+  const MappingScreen(
+      {super.key, required this.transactions, required this.tags});
+
+  @override
+  State<MappingScreen> createState() => _MappingScreenState();
+}
+
+class _MappingScreenState extends State<MappingScreen> {
+  final Map<String, String?> mapping = {};
+
+  @override
+  void initState() {
+    super.initState();
+    for (final tag in widget.tags) {
+      mapping[tag] = null;
+    }
+  }
+
+  List<Emi> getOptions(String tag) {
+    final isDebit = widget.transactions
+        .any((tx) => tx['group_tag'] == tag && (tx['debit'] ?? 0) > 0);
+    final loanLendBox = Hive.box<Emi>('emis');
+    final allEntries = loanLendBox.values.toList();
+    return allEntries
+        .where((entry) =>
+            (isDebit && entry.emiType == 'loan') ||
+            (!isDebit && entry.emiType == 'lend'))
+        .toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Map Group Tags")),
+      body: ListView.builder(
+        padding: const EdgeInsets.all(16),
+        itemCount: widget.tags.length,
+        itemBuilder: (context, index) {
+          final tag = widget.tags[index];
+          final options = getOptions(tag);
+
+          return Card(
+            margin: const EdgeInsets.only(bottom: 20),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    tag,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButton<String>(
+                    isExpanded: true,
+                    value: mapping[tag],
+                    hint: const Text("Select from available loans/lends"),
+                    items: options
+                        .map((e) => DropdownMenuItem<String>(
+                              value: e.id,
+                              child: Text(e.title),
+                            ))
+                        .toList(),
+                    onChanged: (value) {
+                      setState(() {
+                        mapping[tag] = value;
+                      });
+                    },
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+      bottomNavigationBar: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: TextButton(
+          onPressed: () {
+            Navigator.pop(context, mapping);
+          },
+          child: const Text(
+            "Done",
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Helper to get transactions sorted by datetime ascending
+List<Transaction> _getSortedTransactions(WidgetRef ref) {
+  final transactions = ref.watch(transactionsNotifierProvider);
+  final sorted = [...transactions]
+    ..sort((a, b) => a.datetime.compareTo(b.datetime));
+  return sorted;
 }

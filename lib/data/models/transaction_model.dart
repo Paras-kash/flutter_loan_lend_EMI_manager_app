@@ -48,23 +48,35 @@ class Transaction {
         loanLendId: loanLendId ?? this.loanLendId,
       );
 
+  Transaction duplicate() {
+    return Transaction(
+      id: DateTime.now().millisecondsSinceEpoch.toString(), // new unique ID
+      title: this.title,
+      description: this.description,
+      amount: this.amount,
+      type: this.type,
+      datetime: DateTime.now(), // current date/time
+      loanLendId: this.loanLendId,
+    );
+  }
+
   factory Transaction.fromMap(Map<String, dynamic> map) => Transaction(
-    id: map["id"].toString(),
-    title: map["title"],
-    description: map["description"],
-    amount: map["amount"].toDouble(),
-    type: map["type"],
-    datetime: DateTime.parse(map["datetime"]),
-    loanLendId: map["loan_lend_id"].toString(),
-  );
+        id: map["id"].toString(),
+        title: map["title"],
+        description: map["description"],
+        amount: map["amount"].toDouble(),
+        type: map["type"],
+        datetime: DateTime.parse(map["datetime"]),
+        loanLendId: map["loan_lend_id"].toString(),
+      );
 
   Map<String, dynamic> toMap() => {
-    "id": id,
-    "title": title,
-    "description": description,
-    "amount": amount,
-    "type": type,
-    "datetime": datetime.toIso8601String(),
-    "loan_lend_id": loanLendId,
-  };
+        "id": id,
+        "title": title,
+        "description": description,
+        "amount": amount,
+        "type": type,
+        "datetime": datetime.toIso8601String(),
+        "loan_lend_id": loanLendId,
+      };
 }
